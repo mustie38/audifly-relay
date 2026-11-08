@@ -24,6 +24,9 @@ log = logging.getLogger("relay")
 
 PROTOCOL_VERSION = 1
 MAX_ROOM_MEMBERS = 8
+MAX_QUEUE = 50
+MAX_CHAT_CHARS = 200
+EMOJIS = {"❤️", "🔥", "👏", "😂", "😍", "🎉", "👍", "😭"}
 MAX_MESSAGE_BYTES = 8192
 RATE_WINDOW_S = 10.0
 RATE_MAX_MESSAGES = 40
@@ -44,6 +47,7 @@ class Room:
         self.code = code
         self.members: dict[str, Member] = {}   # ekleme sırası = katılma sırası (ilk üye = sahip)
         self.state: dict | None = None
+        self.queue: list[dict] = []            # ortak sıra
         self.state_at = 0.0
 
     @property
@@ -152,7 +156,8 @@ async def handler(ws):
                     state = {**room.state, "from": room.host_id,
                              "age_ms": int((time.monotonic() - room.state_at) * 1000)}
                 await send(ws, {"t": "joined", "id": member.id, "host": room.host_id,
-                                "members": room.members_payload(), "state": state})
+                                "members": room.members_payload(), "state": state,
+                                "queue": room.queue})
                 await broadcast(room, {"t": "members", "host": room.host_id,
                                        "members": room.members_payload()}, skip=member.id)
                 log.info("%s odaya katıldı (%s), üye sayısı: %d", member.name, code, len(room.members))
@@ -169,6 +174,32 @@ async def handler(ws):
                 await broadcast(room, {**state, "from": member.id, "age_ms": 0}, skip=member.id)
             elif kind == "ping":
                 await send(ws, {"t": "pong"})
+            elif kind == "chat":
+                text = re.sub(r"\s+", " ", str(msg.get("text", ""))).strip()[:MAX_CHAT_CHARS]
+                if text:
+                    await broadcast(room, {"t": "chat", "from": member.id,
+                                           "name": member.name, "text": text}, skip=member.id)
+            elif kind == "emoji":
+                if msg.get("e") in EMOJIS:
+                    await broadcast(room, {"t": "emoji", "from": member.id,
+                                           "name": member.name, "e": msg["e"]}, skip=member.id)
+            elif kind == "queue_add":
+                song = clean_song(msg.get("song"))
+                if song is not None and len(room.queue) < MAX_QUEUE:
+                    room.queue.append({**song, "by": member.name})
+                    await broadcast(room, {"t": "queue", "items": room.queue})
+            elif kind == "queue_remove":
+                url = str(msg.get("url", ""))
+                for i, item in enumerate(room.queue):
+                    if item.get("webpage_url") == url:
+                        del room.queue[i]
+                        await broadcast(room, {"t": "queue", "items": room.queue})
+                        break
+            elif kind == "queue_pop":
+                # Yalnız baştaki şarkı çalınmak üzere alınmışsa düşer (çift istek zararsız)
+                if room.queue and room.queue[0].get("webpage_url") == str(msg.get("url", "")):
+                    room.queue.pop(0)
+                    await broadcast(room, {"t": "queue", "items": room.queue})
     finally:
         if member is not None and room is not None:
             room.members.pop(member.id, None)
