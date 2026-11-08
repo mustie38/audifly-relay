@@ -10,6 +10,7 @@ Sağlık kontrolü: GET /health -> 200 (Render/Fly/Railway için)
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -48,6 +49,7 @@ class Room:
         self.members: dict[str, Member] = {}   # ekleme sırası = katılma sırası (ilk üye = sahip)
         self.state: dict | None = None
         self.queue: list[dict] = []            # ortak sıra
+        self.pw_hash: str = ""                 # boşsa şifresiz oda (ilk giren belirler)
         self.state_at = 0.0
 
     @property
@@ -83,6 +85,18 @@ def clean_song(raw) -> dict | None:
     return out
 
 
+def _clean_ms(value, limit: int) -> int:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return max(0, min(int(value), limit))
+    return 0
+
+
+def clean_pw(raw) -> str:
+    """İstemci SHA-256 özeti yollar (64 hex); düz şifre sunucuya hiç gelmez."""
+    value = str(raw or "")
+    return value if re.fullmatch(r"[0-9a-f]{64}", value) else ""
+
+
 def clean_state(raw: dict) -> dict | None:
     song = clean_song(raw.get("song"))
     if song is None:
@@ -97,6 +111,8 @@ def clean_state(raw: dict) -> dict | None:
         "playing": bool(raw.get("playing")),
         "pos_ms": max(0, min(int(pos), 86_400_000)),
         "hb": bool(raw.get("hb")),
+        "sync": bool(raw.get("sync")),
+        "lat": _clean_ms(raw.get("lat"), 5000),
     }
 
 
@@ -144,7 +160,15 @@ async def handler(ws):
                 if not CODE_RE.match(code):
                     await send(ws, {"t": "error", "msg": "Oda kodu 4-12 harf/rakam olmalı."})
                     return
-                room = ROOMS.setdefault(code, Room(code))
+                pw = clean_pw(msg.get("pw"))
+                room = ROOMS.get(code)
+                if room is None:
+                    room = ROOMS[code] = Room(code)
+                    room.pw_hash = pw                 # odayı açan şifreyi belirler
+                elif room.pw_hash and not hmac.compare_digest(room.pw_hash, pw):
+                    await send(ws, {"t": "error", "msg": "Oda şifresi yanlış."})
+                    room = None
+                    return
                 if len(room.members) >= MAX_ROOM_MEMBERS:
                     await send(ws, {"t": "error", "msg": "Oda dolu."})
                     room = None
@@ -157,7 +181,7 @@ async def handler(ws):
                              "age_ms": int((time.monotonic() - room.state_at) * 1000)}
                 await send(ws, {"t": "joined", "id": member.id, "host": room.host_id,
                                 "members": room.members_payload(), "state": state,
-                                "queue": room.queue})
+                                "queue": room.queue, "locked": bool(room.pw_hash)})
                 await broadcast(room, {"t": "members", "host": room.host_id,
                                        "members": room.members_payload()}, skip=member.id)
                 log.info("%s odaya katıldı (%s), üye sayısı: %d", member.name, code, len(room.members))
@@ -173,7 +197,21 @@ async def handler(ws):
                 room.state["from"] = member.id
                 await broadcast(room, {**state, "from": member.id, "age_ms": 0}, skip=member.id)
             elif kind == "ping":
-                await send(ws, {"t": "pong"})
+                echo = msg.get("c")
+                await send(ws, {"t": "pong", "c": echo if isinstance(echo, (int, float))
+                                and not isinstance(echo, bool) else 0})
+            elif kind == "transfer":
+                # Yalnız oda sahibi sahipliği devredebilir: hedef üye listenin başına geçer.
+                target = str(msg.get("to", ""))
+                if member.id == room.host_id and target in room.members and target != member.id:
+                    room.members = {target: room.members[target],
+                                    **{k: v for k, v in room.members.items() if k != target}}
+                    await broadcast(room, {"t": "members", "host": room.host_id,
+                                           "members": room.members_payload()})
+            elif kind == "sync_req":
+                host = room.members.get(room.host_id)
+                if host is not None and host.id != member.id:
+                    await send(host.ws, {"t": "sync_req", "from": member.id})
             elif kind == "chat":
                 text = re.sub(r"\s+", " ", str(msg.get("text", ""))).strip()[:MAX_CHAT_CHARS]
                 if text:
