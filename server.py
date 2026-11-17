@@ -418,14 +418,10 @@ async def handler(ws):
                     await send(ws, {"t": "error", "code": "not_joined",
                                     "msg": "Önce odaya katılmalısın."})
                     return
-                action = "create" if (kind == "create" or msg.get("mode") == "create") else "join"
-                if msg.get("v") != PROTOCOL_VERSION:
+                v = msg.get("v")
+                if v not in (1, 2):
                     await send(ws, {"t": "error", "code": "version_mismatch",
                                     "msg": "Uygulama sürümü sunucuyla uyumsuz."})
-                    return
-                if request_rate_limited(ip, action):
-                    await send(ws, {"t": "error", "code": "rate_limited",
-                                    "msg": "Çok fazla oda isteği. Lütfen biraz bekle."})
                     return
                 code = str(msg.get("room", "")).upper()
                 if not CODE_RE.match(code):
@@ -434,6 +430,14 @@ async def handler(ws):
                     return
                 pw = clean_pw(msg.get("pw"))
                 existing = ROOMS.get(code)
+                if v == 1:
+                    action = "create" if (kind == "create" or msg.get("mode") == "create" or (kind == "join" and existing is None)) else "join"
+                else:
+                    action = "create" if (kind == "create" or msg.get("mode") == "create") else "join"
+                if request_rate_limited(ip, action):
+                    await send(ws, {"t": "error", "code": "rate_limited",
+                                    "msg": "Çok fazla oda isteği. Lütfen biraz bekle."})
+                    return
                 if action == "create":
                     if existing is not None:
                         await send(ws, {"t": "error", "code": "room_exists",
@@ -563,4 +567,3 @@ async def run(host: str = "0.0.0.0", port: int = 8765):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     asyncio.run(run(port=int(os.environ.get("PORT", "8765"))))
-
