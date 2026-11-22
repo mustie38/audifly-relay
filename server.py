@@ -21,6 +21,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -143,7 +144,10 @@ def _normalize_ip(raw: str) -> str:
     if not raw:
         return ""
     try:
-        return str(ipaddress.ip_address(raw))
+        addr = ipaddress.ip_address(raw)
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        return str(addr)
     except ValueError:
         return ""
 
@@ -328,7 +332,7 @@ def clean_song(raw) -> dict | None:
 
 
 def _clean_ms(value, limit: int) -> int:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
         return max(0, min(int(value), limit))
     return 0
 
@@ -352,7 +356,7 @@ def clean_state(raw: dict, last_seq: int = 0) -> dict | None:
     seq, pos = raw.get("seq"), raw.get("pos_ms")
     if not is_valid_seq(seq) or seq <= last_seq:
         return None
-    if not isinstance(pos, (int, float)) or isinstance(pos, bool):
+    if not isinstance(pos, (int, float)) or isinstance(pos, bool) or not math.isfinite(pos):
         return None
     return {
         "t": "state", "seq": seq, "song": song,
@@ -497,8 +501,12 @@ async def handler(ws):
                 await broadcast(room, {**state, "from": member.id, "age_ms": 0}, skip=member.id)
             elif kind == "ping":
                 echo = msg.get("c")
-                await send(ws, {"t": "pong", "c": echo if isinstance(echo, (int, float))
-                                and not isinstance(echo, bool) else 0})
+                valid_echo = (
+                    isinstance(echo, (int, float))
+                    and not isinstance(echo, bool)
+                    and math.isfinite(echo)
+                )
+                await send(ws, {"t": "pong", "c": echo if valid_echo else 0})
             elif kind == "transfer":
                 # Yalnız oda sahibi sahipliği devredebilir: hedef üye listenin başına geçer.
                 target = str(msg.get("to", ""))
